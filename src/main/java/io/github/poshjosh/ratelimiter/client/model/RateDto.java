@@ -4,13 +4,10 @@ import lombok.*;
 
 import java.time.Duration;
 
-@Getter
-@Setter
+@Data
+@Builder
 @NoArgsConstructor
 @AllArgsConstructor
-@EqualsAndHashCode
-@Builder
-@ToString
 public class RateDto {
     private static final Duration DEFAULT_DURATION = Duration.ofSeconds(1);
 
@@ -30,15 +27,15 @@ public class RateDto {
 
     public void validate() {
         // TODO Use spring boot custom validation
-        if ((rate == null || rate.isBlank()) && permits < 1) {
+        if ((rate == null || rate.isEmpty()) && permits < 1) {
             throw new IllegalArgumentException(
                     "Specify either rate or permits.");
         }
-        if ((rate != null && !rate.isBlank()) && permits > 0) {
+        if ((rate != null && !rate.isEmpty()) && permits > 0) {
             throw new IllegalArgumentException(
                     "Specify either rate or permits, not both.");
         }
-        if (factoryClass != null && !factoryClass.isBlank()) {
+        if (factoryClass != null && !factoryClass.isEmpty()) {
             try {
                 Class.forName(factoryClass);
             } catch (ClassNotFoundException e) {

@@ -4,13 +4,10 @@ import lombok.*;
 
 import java.util.List;
 
-@Getter
-@Setter
+@Data
+@Builder
 @NoArgsConstructor
 @AllArgsConstructor
-@EqualsAndHashCode
-@Builder
-@ToString
 public class RatesDto {
 
     private String parentId;
@@ -25,7 +22,7 @@ public class RatesDto {
     private String when;
 
     public void validate() {
-        if (id == null || id.isBlank()) {
+        if (id == null || id.isEmpty()) {
             throw new IllegalArgumentException("RatesDto##id is required.");
         }
         if ((operator == null || operator == Operator.NONE) && rates.size() > 1) {

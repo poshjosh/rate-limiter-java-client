@@ -4,46 +4,95 @@ import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.github.poshjosh.ratelimiter.client.model.HttpRequestDto;
+import io.github.poshjosh.ratelimiter.client.model.HttpRequestDtos;
 import io.github.poshjosh.ratelimiter.client.model.RateDto;
 import io.github.poshjosh.ratelimiter.client.model.RatesDto;
+import okhttp3.*;
+import okio.BufferedSink;
 
+import javax.servlet.http.HttpServletRequest;
 import java.io.IOException;
-import java.net.URI;
-import java.net.http.HttpClient;
-import java.net.http.HttpRequest;
-import java.net.http.HttpResponse;
-import java.time.Duration;
+import java.nio.charset.Charset;
+import java.nio.charset.StandardCharsets;
 import java.util.*;
-import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.TimeoutException;
-import java.util.function.Consumer;
+import java.util.logging.Level;
+import java.util.logging.Logger;
 import java.util.stream.Collectors;
 
 public class RateLimiterServiceClient {
-    private final String baseUrl;
-    private final HttpClient httpClient;
-    private final ObjectMapper objectMapper;
-    private final HttpRequest.BodyPublisher emptyBodyPublisher =
-            HttpRequest.BodyPublishers.noBody();
-    private final HttpResponse.BodyHandler<String> responseBodyHandler =
-            HttpResponse.BodyHandlers.ofString();
+    private static final Logger LOGGER = Logger.getLogger(RateLimiterServiceClient.class.getName());
+    private static final MediaType applicationJson = MediaType.parse("application/json");
+    private static final RequestBody emptyRequestBody = new RequestBody() {
+        @Override public MediaType contentType() { return applicationJson; }
+        @Override public void writeTo(BufferedSink bufferedSink) { /* Nothing to write */ }
+    };
 
-    public RateLimiterServiceClient(String baseUrl) {
-        this(baseUrl,
-                HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(30)).build(),
+    private final String serverBaseUrl;
+    private final Charset charset;
+    private final OkHttpClient httpClient;
+    private final ObjectMapper objectMapper;
+    private final Set<String> postedRateIds;
+
+    public RateLimiterServiceClient(String serverBaseUrl) {
+        this(serverBaseUrl, StandardCharsets.ISO_8859_1,
+                new OkHttpClient.Builder()
+                        .connectTimeout(15, TimeUnit.SECONDS)
+                        .readTimeout(15, TimeUnit.SECONDS)
+                        .build(),
                 new ObjectMapper().findAndRegisterModules());
     }
-    public RateLimiterServiceClient(
-            String baseUrl, HttpClient httpClient, ObjectMapper objectMapper) {
-        this.baseUrl = Objects.requireNonNull(baseUrl);
-        this.httpClient = Objects.requireNonNull(httpClient);
-        this.objectMapper = Objects.requireNonNull(objectMapper);
+
+    protected RateLimiterServiceClient(
+            String serverBaseUrl, Charset charset,
+            OkHttpClient httpClient, ObjectMapper objectMapper) {
+        this(serverBaseUrl, charset, httpClient, objectMapper, new HashSet<>());
     }
 
-    public RatesDto getRates(String id) throws IOException, InterruptedException {
-        HttpRequest request = request("/rates/" + id).GET().build();
-        String responseBodyStr = httpClient.send(request, responseBodyHandler).body();
+    protected RateLimiterServiceClient(
+            String serverBaseUrl, Charset charset,
+            OkHttpClient httpClient, ObjectMapper objectMapper,
+            Set<String> postedRateIds) {
+        this.serverBaseUrl = Objects.requireNonNull(serverBaseUrl);
+        this.charset = Objects.requireNonNull(charset);
+        this.httpClient = Objects.requireNonNull(httpClient);
+        this.objectMapper = Objects.requireNonNull(objectMapper);
+        this.postedRateIds = Objects.requireNonNull(postedRateIds);
+    }
+
+    public RateLimiterServiceClient withTimeout(long timeout, TimeUnit timeUnit) {
+        OkHttpClient newHttpClient = httpClient.newBuilder()
+                .connectTimeout(timeout, timeUnit)
+                .readTimeout(timeout, timeUnit)
+                .build();
+        return new RateLimiterServiceClient(
+                serverBaseUrl, charset, newHttpClient, objectMapper, postedRateIds);
+    }
+
+    public boolean checkLimit(HttpServletRequest request, String id, String rate) {
+        return checkLimit(request, null, id, rate, null);
+    }
+
+    public boolean checkLimit(
+            HttpServletRequest request, String id, String rate, String condition) {
+        return checkLimit(request, null, id, rate, condition);
+    }
+
+    public boolean checkLimit(
+            HttpServletRequest request, String parentId, String id, String rate, String condition) {
+        if (!postedRateIds.contains(id)) {
+            try {
+                this.postRate(parentId, id, rate, condition);
+            } catch (IOException | ServerException e) {
+                return onError("Post rate", e, id, request);
+            }
+        }
+        return this.tryToAcquirePermitQuietly(id, request);
+    }
+
+    public RatesDto getRates(String id) throws IOException, ServerException {
+        final Request request = request("/rates/" + id).get().build();
+        final String responseBodyStr = sendForStringResponse(request);
         return objectMapper.readValue(responseBodyStr, RatesDto.class);
     }
 
@@ -68,11 +117,13 @@ public class RateLimiterServiceClient {
      * @return The posted rate limits for the provided mappings.
      */
     public List<RatesDto> postRateTree(Map<String, Object> rateTree)
-            throws IOException, InterruptedException {
-        HttpRequest request = request("/rates/tree")
-                .POST(requestBody(rateTree)).build();
-        String responseBodyStr = httpClient.send(request, responseBodyHandler).body();
-        return objectMapper.readValue(responseBodyStr, new TypeReference<>() { });
+            throws IOException, ServerException {
+        final Request request = request("/rates/tree").post(requestBody(rateTree)).build();
+        final String responseBodyStr = sendForStringResponse(request);
+        final List<RatesDto> result = objectMapper
+                .readValue(responseBodyStr, new TypeReference<List<RatesDto>>() { });
+        result.stream().map(RatesDto::getId).forEach(postedRateIds::add);
+        return result;
     }
 
     /**
@@ -90,17 +141,16 @@ public class RateLimiterServiceClient {
      * @return The posted rate limits for the provided mappings.
      */
     public List<RatesDto> postRates(Map<String, String> limitMappings)
-            throws IOException, InterruptedException {
+            throws IOException, ServerException {
         List<RatesDto> ratesDtos = limitMappings.entrySet().stream()
                 .map(entry -> RatesDto.builder()
                         .id(entry.getKey())
-                        .rates(List.of(RateDto.builder().rate(entry.getValue()).build())).build())
+                        .rates(Collections.singletonList(RateDto.builder().rate(entry.getValue()).build())).build())
                 .collect(Collectors.toList());
         return postRates(ratesDtos);
     }
 
-    public List<RatesDto> postRates(List<RatesDto> ratesDtos)
-            throws IOException, InterruptedException {
+    public List<RatesDto> postRates(List<RatesDto> ratesDtos) throws IOException, ServerException {
         final List<RatesDto> result = new ArrayList<>(ratesDtos.size());
         for (RatesDto rates : ratesDtos) {
             result.add(postRate(rates));
@@ -108,108 +158,182 @@ public class RateLimiterServiceClient {
         return Collections.unmodifiableList(result);
     }
 
-    public RatesDto postRate(RatesDto ratesDto) throws IOException, InterruptedException {
-        HttpRequest request = request("/rates").POST(requestBody(ratesDto)).build();
-        String responseBodyStr = httpClient.send(request, responseBodyHandler).body();
-        return objectMapper.readValue(responseBodyStr, RatesDto.class);
+    public RatesDto postRate(String rateId, String rate) throws IOException, ServerException {
+        return postRate(rateId, rate, null);
     }
 
-    public void deleteRates(String id) throws IOException, InterruptedException {
-        httpClient.send(
-                request("/rates/" + id).DELETE().build(),
-                HttpResponse.BodyHandlers.discarding());
+    public RatesDto postRate(String rateId, String rate, String condition) throws IOException, ServerException {
+        return postRate(null, rateId, rate, condition);
     }
 
-    public Boolean checkAndAsyncAcquire(
-            String rateId, /* Nullable */ HttpRequestDto request,
-            int timeout, TimeUnit timeUnit) {
-        return checkAndAsyncAcquire(
-                rateId, 1, request, timeout, timeUnit, Throwable::printStackTrace);
+    public RatesDto postRate(String parentId, String rateId, String rate, String condition) throws IOException, ServerException {
+        RateDto rateDto = RateDto.builder().rate(rate).when(condition).build();
+        RatesDto ratesDto = RatesDto.builder()
+                .parentId(parentId).id(rateId).rates(Collections.singletonList(rateDto)).build();
+        return postRate(ratesDto);
     }
 
-    public Boolean checkAndAsyncAcquire(
-            String rateId, int permits, /* Nullable */ HttpRequestDto request,
-            long timeout, TimeUnit timeUnit, Consumer<Exception> onException) {
+    public RatesDto postRate(RatesDto ratesDto) throws IOException, ServerException {
+        final Request request = request("/rates").post(requestBody(ratesDto)).build();
+        final String responseBodyStr = sendForStringResponse(request);
+        final RatesDto result = objectMapper.readValue(responseBodyStr, RatesDto.class);
+        postedRateIds.add(result.getId());
+        return result;
+    }
+
+    public void deleteRates(String id) throws IOException, ServerException {
+        final Request request = request("/rates/" + id).delete().build();
+        sendForNoResponseBody(request);
+    }
+
+    public boolean isPermitAvailable(String rateId) throws IOException, ServerException {
+        return isPermitAvailable(rateId, (HttpRequestDto)null);
+    }
+
+    public boolean isPermitAvailable(String rateId, /* Nullable */ HttpServletRequest request)
+            throws IOException, ServerException {
+        return isPermitAvailable(rateId, HttpRequestDtos.of(request));
+    }
+
+    protected boolean isPermitAvailable(String rateId, /* Nullable */ HttpRequestDto requestDto)
+            throws IOException, ServerException {
+        final String path = "/permits/available?rateId=" + rateId;
+        final RequestBody requestBody = requestBody(requestDto);
+        final Request request = request(path).patch(requestBody).build();
+        final String responseBodyStr = sendForStringResponse(request);
+        return Boolean.parseBoolean(responseBodyStr);
+    }
+
+    /**
+     * Tries to acquire a single permit.
+     * @param rateId The id of the rate to acquire permits from.
+     * @return True if permits are acquired, false otherwise.
+     * @throws IOException If there was an error communicating with the server.
+     * @throws ServerException If the server returned an error response.
+     * @see #tryToAcquirePermits(String, int, boolean, HttpRequestDto)
+     */
+    public boolean tryToAcquirePermit(String rateId) throws IOException, ServerException {
+        return tryToAcquirePermits(rateId, 1, false, (HttpRequestDto)null);
+    }
+
+    /**
+     * Try to acquire a single permit. (A convenience method)
+     * @param rateId The id of the rate to acquire permits from.
+     * @param request The HttpServletRequest to acquire permits for.
+     * @return True if permits are acquired, false otherwise.
+     * @see #tryToAcquirePermits(String, int, boolean, HttpRequestDto)
+     */
+    public boolean tryToAcquirePermitQuietly(
+            String rateId, /* Nullable */ HttpServletRequest request) {
         try {
-            return tryToAcquirePermits(rateId, permits, true, request, timeout, timeUnit);
-        } catch (IOException | InterruptedException | ExecutionException | TimeoutException e) {
-            Thread.currentThread().interrupt();
-            onException.accept(e);
-            return Boolean.TRUE;
+            return tryToAcquirePermits(rateId, 1, false, request);
+        } catch (IOException | ServerException e) {
+            return onError("Acquire permit", e, rateId, request);
         }
     }
 
-    public Boolean isPermitAvailable(String rateId) throws IOException, InterruptedException {
-        return isPermitAvailable(rateId, null);
+    protected boolean onError(
+            String action, Exception exception,
+            String rateId, /* Nullable */ HttpServletRequest request) {
+        if (LOGGER.isLoggable(Level.WARNING)) {
+            LOGGER.warning(action + " error. Rate: "+rateId+" for: "+request+". "+exception);
+        }
+        return true;
     }
 
-    public Boolean isPermitAvailable(String rateId, /* Nullable */ HttpRequestDto request)
-            throws IOException, InterruptedException {
-        final String path = "/permits?rateId=" + rateId;
-        final HttpRequest.BodyPublisher requestBody = requestBody(request);
-        final String responseBodyStr = httpClient.send(
-                request(path).method("GET", requestBody).build(),
-                responseBodyHandler).body();
-        return Boolean.valueOf(responseBodyStr);
+    /**
+     * Try to acquire the specified number of permits.
+     * @param rateId The id of the rate to acquire permits from.
+     * @param permits The number of permits to acquire.
+     * @param async Whether to acquire the permits asynchronously on the server.
+     * @param request The HttpServletRequest to acquire permits for.
+     * @return True if permits are available, false otherwise.
+     * @throws IOException If there was an error communicating with the server.
+     * @throws ServerException If the server returned an error response.
+     * @see #tryToAcquirePermits(String, int, boolean, HttpRequestDto)
+     */
+    public boolean tryToAcquirePermits(
+            String rateId, int permits, boolean async, /* Nullable */ HttpServletRequest request)
+            throws IOException, ServerException {
+        return tryToAcquirePermits(rateId, permits, async, HttpRequestDtos.of(request));
     }
 
-    public Boolean isPermitAvailable(
-            String rateId, /* Nullable */ HttpRequestDto request,
-            long timeout, TimeUnit timeUnit)
-            throws IOException, InterruptedException, ExecutionException, TimeoutException {
-        final String path = "/permits?rateId=" + rateId;
-        final String responseBodyStr = httpClient.sendAsync(
-                request(path).method("GET", requestBody(request)).build(),
-                responseBodyHandler).get(timeout, timeUnit).body();
-        return Boolean.valueOf(responseBodyStr);
+    /**
+     * Try to acquire the specified number of permits.
+     * <p>
+     * If async is true, the async part is done on the server. The server
+     * checks if permits are available and return true if it is, otherwise
+     * it returns false. Before returning, the server starts an async
+     * process to acquire the permits.
+     * </p>
+     * @param rateId The id of the rate to acquire permits from.
+     * @param permits The number of permits to acquire.
+     * @param async Whether to acquire the permits asynchronously on the server.
+     * @param requestDto An object encapsulating request data, to acquire permits for.
+     * @return True if permits are available, false otherwise.
+     * @throws IOException If there was an error communicating with the server.
+     * @throws ServerException If the server returned an error response.
+     */
+    protected boolean tryToAcquirePermits(
+            String rateId, int permits, boolean async, /* Nullable */ HttpRequestDto requestDto)
+            throws IOException, ServerException {
+        final String path = String.format(
+                "/permits/acquire?rateId=%s&permits=%d&async=%s", rateId, permits, async);
+        final Request request = request(path).patch(requestBody(requestDto)).build();
+        final String responseBodyStr = sendForStringResponse(request, false);
+        return Boolean.parseBoolean(responseBodyStr);
     }
 
-    public Boolean tryToAcquirePermit(String rateId)
-            throws IOException, InterruptedException {
-        return tryToAcquirePermits(rateId, 1, false, null);
-    }
-
-    public Boolean tryToAcquirePermits(
-            String rateId, int permits, boolean async, /* Nullable */ HttpRequestDto request)
-            throws IOException, InterruptedException {
-        final String path = path(rateId, permits, async);
-        final String responseBodyStr = httpClient.send(
-                request(path).PUT(requestBody(request)).build(),
-                responseBodyHandler).body();
-        return Boolean.valueOf(responseBodyStr);
-    }
-
-    public Boolean tryToAcquirePermits(
-            String rateId, int permits, boolean async, /* Nullable */ HttpRequestDto request,
-            long timeout, TimeUnit timeUnit)
-            throws IOException, InterruptedException, ExecutionException, TimeoutException {
-        final String path = path(rateId, permits, async);
-        final String responseBodyStr = httpClient.sendAsync(
-                request(path).PUT(requestBody(request)).build(),
-                responseBodyHandler)
-                .get(timeout, timeUnit).body();
-        return Boolean.valueOf(responseBodyStr);
-    }
-
-    private String path(String rateId, int permits, boolean async) {
-        return String.format("/permits?rateId=%s&permits=%d&async=%s", rateId, permits, async);
-    }
-
-    private HttpRequest.Builder request(String path) {
-        return HttpRequest.newBuilder()
-                .uri(URI.create(url(path)))
+    private Request.Builder request(String path) {
+        return new Request.Builder()
+                .url(url(path))
                 .header("Content-Type", "application/json");
     }
 
-    private HttpRequest.BodyPublisher requestBody(Object body) throws JsonProcessingException {
+    private RequestBody requestBody(Object body) throws JsonProcessingException {
         if (body == null) {
-            return emptyBodyPublisher;
+            return emptyRequestBody;
         }
-        String requestBodyStr = objectMapper.writeValueAsString(body);
-        return HttpRequest.BodyPublishers.ofString(requestBodyStr);
+        String json = objectMapper.writeValueAsString(body);
+        return RequestBody.create(applicationJson, json.getBytes(charset));
+    }
+
+    private void sendForNoResponseBody(Request request) throws IOException, ServerException {
+        try(Response response = httpClient.newCall(request).execute()) {
+            if (!response.isSuccessful()) {
+                complain(response);
+            }
+        }
+    }
+
+    private String sendForStringResponse(Request request) throws IOException, ServerException {
+        return sendForStringResponse(request, true);
+    }
+
+    private String sendForStringResponse(Request request, boolean failOnError)
+            throws IOException, ServerException {
+        try(Response response = httpClient.newCall(request).execute()) {
+            if (failOnError && !response.isSuccessful()) {
+                complain(response);
+            }
+            String responseBodyStr = responseBodyStr(response);
+            if (responseBodyStr == null || responseBodyStr.isEmpty()) {
+                complain(response);
+            }
+            return responseBodyStr;
+        }
+    }
+
+    private void complain(Response response) throws IOException, ServerException {
+        throw new ServerException(response.code(), response.message(), responseBodyStr(response));
+    }
+
+    private String responseBodyStr(Response response) throws IOException {
+        ResponseBody responseBody = response.body();
+        return responseBody == null ? null : responseBody.string();
     }
 
     private String url(String path) {
-        return baseUrl + path;
+        return serverBaseUrl + path;
     }
 }
