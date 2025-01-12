@@ -9,12 +9,12 @@ import java.util.Map;
 public class HappyPathCheck {
     private static final String serviceUrl = "http://localhost:8080";
 
-    public static void main(String... args) throws IOException, ServerException {
+    public static void main(String... args) throws IOException, RateLimiterClient.ServerException {
         happyPath();
     }
 
-    private static void happyPath() throws IOException, ServerException {
-        final RateLimiterServiceClient client = new RateLimiterServiceClient(serviceUrl);
+    private static void happyPath() throws IOException, RateLimiterClient.ServerException {
+        final RateLimiterClient client = new RateLimiterClient(serviceUrl);
 
         final String rateId = HappyPathCheck.class.getSimpleName();
         log("POST expected rate of: 1/s, result: " + client
@@ -37,6 +37,11 @@ public class HappyPathCheck {
                 .get(0).getRates().get(0).getRate());
         client.deleteRates(rateId);
         log("Delete successful");
+
+        final String rate = "2/m";
+        log("isWithinLimit("+rate+") expected: true, result: " + client.isWithinLimit(null, rateId, rate));
+        log("isWithinLimit("+rate+") expected: true, result: " + client.isWithinLimit(null, rateId, rate));
+        log("isWithinLimit("+rate+") expected: false, result: " + client.isWithinLimit(null, rateId, rate));
     }
 
     private static void log(String message) {

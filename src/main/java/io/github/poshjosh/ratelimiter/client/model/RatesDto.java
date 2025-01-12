@@ -20,18 +20,4 @@ public class RatesDto {
     private List<RateDto> rates;
 
     private String when;
-
-    public void validate() {
-        if (id == null || id.isEmpty()) {
-            throw new IllegalArgumentException("RatesDto##id is required.");
-        }
-        if ((operator == null || operator == Operator.NONE) && rates.size() > 1) {
-            throw new IllegalArgumentException(
-                    "RatesDto#operator is required, when there are more than one rates");
-        }
-        if ((rates == null || rates.isEmpty())) {
-            throw new IllegalArgumentException("RatesDto#rate is required");
-        }
-        rates.forEach(RateDto::validate);
-    }
 }

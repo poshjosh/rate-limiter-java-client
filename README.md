@@ -30,22 +30,19 @@ pom.xml
 rest controller
 
 ```java
-import io.github.poshjosh.ratelimiter.client.RateLimiterServiceClient;
+import io.github.poshjosh.ratelimiter.client.RateLimiterClient;
 
-@RestController("/messages") 
-public class MessageController {
-    
-    private final RateLimiterServiceClient rateLimiter = 
-            new RateLimiterServiceClient("http://localhost:8080");
-    
-    @PostMapping("/greet")
-    public ResponseEntity<String> greet(HttpServletRequest request) {
-        
-        rateLimiter.checkLimit(request, "messages.greet", 
-                "6/m", "web.request.header[X-RATE-LIMITED] = true");
-        
-        return ResponseEntity.ok("Hello World!");
-    }
+@RestController("/messages") public class MessageController {
+
+  private final RateLimiterClient rateLimiter = new RateLimiterClient("http://localhost:8080");
+
+  @PostMapping("/greet") public ResponseEntity<String> greet(HttpServletRequest request) {
+
+    rateLimiter.isWithinLimit(request, "messages.greet", "6/m",
+            "web.request.header[X-RATE-LIMITED] = true");
+
+    return ResponseEntity.ok("Hello World!");
+  }
 }
 ```
 

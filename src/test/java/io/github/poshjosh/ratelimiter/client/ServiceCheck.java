@@ -8,8 +8,8 @@ import java.util.Collections;
 public class ServiceCheck {
     private static final String serviceUrl = "http://localhost:8080";
     
-    public static void main(String... args) throws IOException, ServerException {
-        final RateLimiterServiceClient client = new RateLimiterServiceClient(serviceUrl);
+    public static void main(String... args) throws IOException, RateLimiterClient.ServerException {
+        final RateLimiterClient client = new RateLimiterClient(serviceUrl);
         final String rateId = ServiceCheck.class.getSimpleName();
 
         long startTime = System.currentTimeMillis();
@@ -18,12 +18,12 @@ public class ServiceCheck {
         System.out.println("Add limit, time spent: " + (System.currentTimeMillis() - startTime));
 
         startTime = System.currentTimeMillis();
-        client.tryToAcquirePermits(rateId, 1, false, givenNoRequest());
+        client.tryToAcquirePermits(givenNoRequest(), rateId, 1, false);
         // average without request: 10 millisecond
         System.out.println("Acquire permit, time spent: " + (System.currentTimeMillis() - startTime));
 
         startTime = System.currentTimeMillis();
-        client.tryToAcquirePermits(rateId, 1, false, givenRequest());
+        client.tryToAcquirePermits(givenRequest(), rateId, 1, false);
         // average with request: 50 milliseconds
         System.out.println("Acquire permit, time spent: " + (System.currentTimeMillis() - startTime));
 

@@ -24,8 +24,6 @@ x
 Hsrc/main/java/io/github/poshjosh/ratelimiter/client/ServerException.java,9/5/95a0ede1996d217a53817e23d397de7c403c84eb
 ~
 Nsrc/main/java/io/github/poshjosh/ratelimiter/client/model/HttpRequestDtos.java,e/d/ed59f1b630e31bae97522214e8b69f646d4c8342
-t
-Dsrc/test/java/io/github/poshjosh/ratelimiter/client/ServiceTest.java,2/b/2b4377a8d16f3df5e6af6685c96b7c3a0ee8e1fe
 u
 Esrc/test/java/io/github/poshjosh/ratelimiter/client/ServiceCheck.java,b/e/be7cba2591e5ec90dca2fc2c8ea580864ac10337
 Å

@@ -3,10 +3,9 @@ package io.github.poshjosh.ratelimiter.client;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
-import io.github.poshjosh.ratelimiter.client.model.HttpRequestDto;
-import io.github.poshjosh.ratelimiter.client.model.HttpRequestDtos;
-import io.github.poshjosh.ratelimiter.client.model.RateDto;
-import io.github.poshjosh.ratelimiter.client.model.RatesDto;
+import io.github.poshjosh.ratelimiter.client.model.*;
+import lombok.EqualsAndHashCode;
+import lombok.Getter;
 import okhttp3.*;
 import okio.BufferedSink;
 
@@ -20,8 +19,8 @@ import java.util.logging.Level;
 import java.util.logging.Logger;
 import java.util.stream.Collectors;
 
-public class RateLimiterServiceClient {
-    private static final Logger LOGGER = Logger.getLogger(RateLimiterServiceClient.class.getName());
+public class RateLimiterClient {
+    private static final Logger LOGGER = Logger.getLogger(RateLimiterClient.class.getName());
     private static final MediaType applicationJson = MediaType.parse("application/json");
     private static final RequestBody emptyRequestBody = new RequestBody() {
         @Override public MediaType contentType() { return applicationJson; }
@@ -32,67 +31,81 @@ public class RateLimiterServiceClient {
     private final Charset charset;
     private final OkHttpClient httpClient;
     private final ObjectMapper objectMapper;
-    private final Set<String> postedRateIds;
+    private final Set<String> existingRateIds;
 
-    public RateLimiterServiceClient(String serverBaseUrl) {
+    public RateLimiterClient(String serverBaseUrl) {
         this(serverBaseUrl, StandardCharsets.ISO_8859_1,
                 new OkHttpClient.Builder()
                         .connectTimeout(15, TimeUnit.SECONDS)
                         .readTimeout(15, TimeUnit.SECONDS)
                         .build(),
-                new ObjectMapper().findAndRegisterModules());
+                new ObjectMapper().findAndRegisterModules(), new HashSet<>());
     }
 
-    protected RateLimiterServiceClient(
-            String serverBaseUrl, Charset charset,
-            OkHttpClient httpClient, ObjectMapper objectMapper) {
-        this(serverBaseUrl, charset, httpClient, objectMapper, new HashSet<>());
-    }
-
-    protected RateLimiterServiceClient(
+    public RateLimiterClient(
             String serverBaseUrl, Charset charset,
             OkHttpClient httpClient, ObjectMapper objectMapper,
-            Set<String> postedRateIds) {
+            Set<String> existingRateIds) {
         this.serverBaseUrl = Objects.requireNonNull(serverBaseUrl);
         this.charset = Objects.requireNonNull(charset);
         this.httpClient = Objects.requireNonNull(httpClient);
         this.objectMapper = Objects.requireNonNull(objectMapper);
-        this.postedRateIds = Objects.requireNonNull(postedRateIds);
+        this.existingRateIds = Objects.requireNonNull(existingRateIds);
     }
 
-    public RateLimiterServiceClient withTimeout(long timeout, TimeUnit timeUnit) {
+    public RateLimiterClient withTimeout(long timeout, TimeUnit timeUnit) {
         OkHttpClient newHttpClient = httpClient.newBuilder()
                 .connectTimeout(timeout, timeUnit)
                 .readTimeout(timeout, timeUnit)
                 .build();
-        return new RateLimiterServiceClient(
-                serverBaseUrl, charset, newHttpClient, objectMapper, postedRateIds);
+        return new RateLimiterClient(
+                serverBaseUrl, charset, newHttpClient, objectMapper, existingRateIds);
     }
 
-    public boolean checkLimit(HttpServletRequest request, String id, String rate) {
-        return checkLimit(request, null, id, rate, null);
+    /**
+     * Checks if the request is within the specified rate limit.
+     * @param request The request to check
+     * @param rateId An identifier for the rate limit to apply
+     * @param rate The rate of the rate limit to apply.
+     *             (used to initialize the limit if not already initialize)
+     * @return True if the request is within the rate limit, false otherwise.
+     * @see #isWithinLimit(HttpServletRequest, String, String, String)
+     */
+    public boolean isWithinLimit(HttpServletRequest request, String rateId, String rate) {
+        return isWithinLimit(request, rateId, rate, null);
     }
 
-    public boolean checkLimit(
-            HttpServletRequest request, String id, String rate, String condition) {
-        return checkLimit(request, null, id, rate, condition);
-    }
+    /**
+     * Checks if the request is within the specified rate limit.
+     * @param request The request to check
+     * @param rateId An identifier for the rate limit to apply
+     * @param rate The rate of the rate limit to apply.
+     *             (used to initialize the limit if not already initialize)
+     * @param condition The condition of the rate limit to apply.
+     *                  E.g. "jvm.memory.available<1GB"
+     * @return True if the request is within the rate limit, false otherwise.
+     */
 
-    public boolean checkLimit(
-            HttpServletRequest request, String parentId, String id, String rate, String condition) {
-        if (!postedRateIds.contains(id)) {
+    public boolean isWithinLimit(
+            /* Nullable */ HttpServletRequest request, String rateId, String rate, String condition) {
+        if (!existingRateIds.contains(rateId)) {
             try {
-                this.postRate(parentId, id, rate, condition);
+                return postRateThenTryToAcquirePermit(request, rateId, rate, condition);
             } catch (IOException | ServerException e) {
-                return onError("Post rate", e, id, request);
+                return onError("Post rate and acquire permit", e, rateId, request);
+            }
+        } else {
+            try {
+                return tryToAcquirePermits(request, rateId, 1, false);
+            } catch (IOException | ServerException e) {
+                return onError("Acquire permit", e, rateId, request);
             }
         }
-        return this.tryToAcquirePermitQuietly(id, request);
     }
 
     public RatesDto getRates(String id) throws IOException, ServerException {
         final Request request = request("/rates/" + id).get().build();
-        final String responseBodyStr = sendForStringResponse(request);
+        final String responseBodyStr = sendForResponseBodyString(request);
         return objectMapper.readValue(responseBodyStr, RatesDto.class);
     }
 
@@ -119,10 +132,10 @@ public class RateLimiterServiceClient {
     public List<RatesDto> postRateTree(Map<String, Object> rateTree)
             throws IOException, ServerException {
         final Request request = request("/rates/tree").post(requestBody(rateTree)).build();
-        final String responseBodyStr = sendForStringResponse(request);
+        final String responseBodyStr = sendForResponseBodyString(request);
         final List<RatesDto> result = objectMapper
                 .readValue(responseBodyStr, new TypeReference<List<RatesDto>>() { });
-        result.stream().map(RatesDto::getId).forEach(postedRateIds::add);
+        result.stream().map(RatesDto::getId).forEach(existingRateIds::add);
         return result;
     }
 
@@ -163,21 +176,17 @@ public class RateLimiterServiceClient {
     }
 
     public RatesDto postRate(String rateId, String rate, String condition) throws IOException, ServerException {
-        return postRate(null, rateId, rate, condition);
-    }
-
-    public RatesDto postRate(String parentId, String rateId, String rate, String condition) throws IOException, ServerException {
         RateDto rateDto = RateDto.builder().rate(rate).when(condition).build();
         RatesDto ratesDto = RatesDto.builder()
-                .parentId(parentId).id(rateId).rates(Collections.singletonList(rateDto)).build();
+                .id(rateId).rates(Collections.singletonList(rateDto)).build();
         return postRate(ratesDto);
     }
 
     public RatesDto postRate(RatesDto ratesDto) throws IOException, ServerException {
         final Request request = request("/rates").post(requestBody(ratesDto)).build();
-        final String responseBodyStr = sendForStringResponse(request);
+        final String responseBodyStr = sendForResponseBodyString(request);
         final RatesDto result = objectMapper.readValue(responseBodyStr, RatesDto.class);
-        postedRateIds.add(result.getId());
+        existingRateIds.add(result.getId());
         return result;
     }
 
@@ -187,20 +196,20 @@ public class RateLimiterServiceClient {
     }
 
     public boolean isPermitAvailable(String rateId) throws IOException, ServerException {
-        return isPermitAvailable(rateId, (HttpRequestDto)null);
+        return isPermitAvailable((HttpRequestDto)null, rateId);
     }
 
-    public boolean isPermitAvailable(String rateId, /* Nullable */ HttpServletRequest request)
+    public boolean isPermitAvailable(/* Nullable */ HttpServletRequest request, String rateId)
             throws IOException, ServerException {
-        return isPermitAvailable(rateId, HttpRequestDtos.of(request));
+        return isPermitAvailable(HttpRequestDtos.of(request), rateId);
     }
 
-    protected boolean isPermitAvailable(String rateId, /* Nullable */ HttpRequestDto requestDto)
+    protected boolean isPermitAvailable(/* Nullable */ HttpRequestDto requestDto, String rateId)
             throws IOException, ServerException {
         final String path = "/permits/available?rateId=" + rateId;
         final RequestBody requestBody = requestBody(requestDto);
         final Request request = request(path).patch(requestBody).build();
-        final String responseBodyStr = sendForStringResponse(request);
+        final String responseBodyStr = sendForResponseBodyString(request);
         return Boolean.parseBoolean(responseBodyStr);
     }
 
@@ -210,26 +219,10 @@ public class RateLimiterServiceClient {
      * @return True if permits are acquired, false otherwise.
      * @throws IOException If there was an error communicating with the server.
      * @throws ServerException If the server returned an error response.
-     * @see #tryToAcquirePermits(String, int, boolean, HttpRequestDto)
+     * @see #tryToAcquirePermits(HttpRequestDto, String, int, boolean)
      */
     public boolean tryToAcquirePermit(String rateId) throws IOException, ServerException {
-        return tryToAcquirePermits(rateId, 1, false, (HttpRequestDto)null);
-    }
-
-    /**
-     * Try to acquire a single permit. (A convenience method)
-     * @param rateId The id of the rate to acquire permits from.
-     * @param request The HttpServletRequest to acquire permits for.
-     * @return True if permits are acquired, false otherwise.
-     * @see #tryToAcquirePermits(String, int, boolean, HttpRequestDto)
-     */
-    public boolean tryToAcquirePermitQuietly(
-            String rateId, /* Nullable */ HttpServletRequest request) {
-        try {
-            return tryToAcquirePermits(rateId, 1, false, request);
-        } catch (IOException | ServerException e) {
-            return onError("Acquire permit", e, rateId, request);
-        }
+        return tryToAcquirePermits((HttpRequestDto)null, rateId, 1, false);
     }
 
     protected boolean onError(
@@ -242,6 +235,45 @@ public class RateLimiterServiceClient {
     }
 
     /**
+     * Add the specified rates (if not already added) then try to acquire 1 permit.
+     * @param request The HttpServletRequest to acquire permits for.
+     * @param rateId The id of the rate to acquire permits from.
+     * @return True if permits are available, false otherwise.
+     * @throws IOException If there was an error communicating with the server.
+     * @throws ServerException If the server returned an error response.
+     * @see #postRatesThenTryToAcquirePermits(LimitDto)
+     */
+    public boolean postRateThenTryToAcquirePermit(
+            /* Nullable */ HttpServletRequest request, String rateId, String rate, String condition)
+            throws IOException, ServerException {
+        RateDto rateDto = RateDto.builder().rate(rate).when(condition).build();
+        RatesDto ratesDto = RatesDto.builder()
+                .id(rateId).rates(Collections.singletonList(rateDto)).build();
+        return postRatesThenTryToAcquirePermits(
+                LimitDto.builder().limit(ratesDto).request(HttpRequestDtos.of(request)).build());
+    }
+
+    /**
+     * Add the specified rates (if not already added) then try to acquire 1 permit.
+     * <p>
+     * If async is true, the async part is done on the server. The server
+     * checks if permits are available and return true if it is, otherwise
+     * it returns false. Before returning, the server starts an async
+     * process to acquire the permits.
+     * </p>
+     * @param limitDto An object encapsulating request data, to add rates and acquire permits for.
+     * @return True if permits are available, false otherwise.
+     * @throws IOException If there was an error communicating with the server.
+     * @throws ServerException If the server returned an error response.
+     */
+    protected boolean postRatesThenTryToAcquirePermits(LimitDto limitDto)
+            throws IOException, ServerException {
+        final Request request = request("/permits/limit").patch(requestBody(limitDto)).build();
+        return sendForResponseCode(request) != 429;
+    }
+
+
+    /**
      * Try to acquire the specified number of permits.
      * @param rateId The id of the rate to acquire permits from.
      * @param permits The number of permits to acquire.
@@ -250,12 +282,12 @@ public class RateLimiterServiceClient {
      * @return True if permits are available, false otherwise.
      * @throws IOException If there was an error communicating with the server.
      * @throws ServerException If the server returned an error response.
-     * @see #tryToAcquirePermits(String, int, boolean, HttpRequestDto)
+     * @see #tryToAcquirePermits(HttpRequestDto, String, int, boolean)
      */
     public boolean tryToAcquirePermits(
-            String rateId, int permits, boolean async, /* Nullable */ HttpServletRequest request)
+            /* Nullable */ HttpServletRequest request, String rateId, int permits, boolean async)
             throws IOException, ServerException {
-        return tryToAcquirePermits(rateId, permits, async, HttpRequestDtos.of(request));
+        return tryToAcquirePermits(HttpRequestDtos.of(request), rateId, permits, async);
     }
 
     /**
@@ -266,22 +298,21 @@ public class RateLimiterServiceClient {
      * it returns false. Before returning, the server starts an async
      * process to acquire the permits.
      * </p>
+     * @param requestDto An object encapsulating request data, to acquire permits for.
      * @param rateId The id of the rate to acquire permits from.
      * @param permits The number of permits to acquire.
      * @param async Whether to acquire the permits asynchronously on the server.
-     * @param requestDto An object encapsulating request data, to acquire permits for.
      * @return True if permits are available, false otherwise.
      * @throws IOException If there was an error communicating with the server.
      * @throws ServerException If the server returned an error response.
      */
     protected boolean tryToAcquirePermits(
-            String rateId, int permits, boolean async, /* Nullable */ HttpRequestDto requestDto)
+            /* Nullable */ HttpRequestDto requestDto, String rateId, int permits, boolean async)
             throws IOException, ServerException {
         final String path = String.format(
                 "/permits/acquire?rateId=%s&permits=%d&async=%s", rateId, permits, async);
         final Request request = request(path).patch(requestBody(requestDto)).build();
-        final String responseBodyStr = sendForStringResponse(request, false);
-        return Boolean.parseBoolean(responseBodyStr);
+        return sendForResponseCode(request) != 429;
     }
 
     private Request.Builder request(String path) {
@@ -306,14 +337,9 @@ public class RateLimiterServiceClient {
         }
     }
 
-    private String sendForStringResponse(Request request) throws IOException, ServerException {
-        return sendForStringResponse(request, true);
-    }
-
-    private String sendForStringResponse(Request request, boolean failOnError)
-            throws IOException, ServerException {
+    private String sendForResponseBodyString(Request request) throws IOException, ServerException {
         try(Response response = httpClient.newCall(request).execute()) {
-            if (failOnError && !response.isSuccessful()) {
+            if (!response.isSuccessful()) {
                 complain(response);
             }
             String responseBodyStr = responseBodyStr(response);
@@ -321,6 +347,17 @@ public class RateLimiterServiceClient {
                 complain(response);
             }
             return responseBodyStr;
+        }
+    }
+
+    private int sendForResponseCode(Request request)
+            throws IOException, ServerException {
+        try(Response response = httpClient.newCall(request).execute()) {
+            final int responseCode = response.code();
+            if (responseCode != 429 && !response.isSuccessful()) {
+                complain(response);
+            }
+            return response.code();
         }
     }
 
@@ -335,5 +372,30 @@ public class RateLimiterServiceClient {
 
     private String url(String path) {
         return serverBaseUrl + path;
+    }
+
+    @Getter
+    @EqualsAndHashCode(callSuper = true)
+    public static class ServerException extends Exception {
+
+        private final int responseCode;
+        private final String responseBody;
+
+        public ServerException() {
+            this(0, null, null);
+        }
+
+        public ServerException(int code, String message, String body) {
+            super(message);
+            this.responseCode = code;
+            this.responseBody = body;
+        }
+
+        @Override
+        public String toString() {
+            return "ServerException{" + "responseCode=" + getResponseCode()
+                    + ", responseMessage='" + getLocalizedMessage() + '\''
+                    + ", responseBody='" + getResponseBody() + '\'' + '}';
+        }
     }
 }
